@@ -1,8 +1,9 @@
 # This fork (LoganBresnahan/burrito, branch `geex`)
 
 A fork of [burrito-elixir/burrito](https://github.com/burrito-elixir/burrito) v1.5.0 for geex and
-pharos-mcp. It is fork-only: nothing here is sent upstream. The branch is v1.5.0 plus the two
-patches below, so `git diff v1.5.0 geex` is the whole of it.
+pharos-mcp. It is fork-only: nothing here is sent upstream. The branch is v1.5.0 plus the changes
+below (two patches, `maintenance purge`, and the wrapper's output on stderr), so
+`git diff v1.5.0 geex` is the whole of it.
 
 ## Patch A: the VM really runs in embedded mode
 
@@ -74,12 +75,51 @@ by this protocol:
   wrapper process itself holds the shared lock (`LockFileEx`) for the VM's life.
   `flock`-equivalent semantics come from Zig's `File.Lock`.
 
+### `maintenance purge`: the contract for any tool
+
+`<binary> maintenance purge` deletes every unpack of this app that no process uses, the current
+version's included, and prints what became of each on stdout:
+- `removed <dir>`;
+- `kept <dir>: in use`, when a runner holds the lock;
+- `kept <dir>: from before the in-use lock, and a process runs from it`, when `/proc` shows one.
+
+It ends with `<n> removed, <m> kept`, and exits 0 even when some were kept.
+
+It runs in the wrapper's maintenance branch, before any lock is taken, so the purging binary
+doesn't hold one itself. A tool that can't take an `flock` (a BEAM can't; `flock(1)` is Linux
+only) calls this instead, so the contract has one implementation on every platform. For example,
+pharos-mcp's `--purge-cache` becomes `$__BURRITO_BIN_PATH maintenance purge`.
+
+### Port programs don't inherit the lock
+
+The lock's descriptor is close-on-exec cleared, so a process the VM starts could in principle
+inherit it and keep an old unpack "in use" after the VM is gone. In practice it doesn't.
+
+Checked on geex: the VM starts every port program through `erl_child_setup`. Neither
+`erl_child_setup` nor the `inotifywait` processes it started had a descriptor for
+`.burrito-in-use`, because `erl_child_setup` closes descriptors before it execs a port program.
+
+A program an app starts some other way (an `os:cmd` through a shell is still `erl_child_setup`;
+a NIF that forks is not) should be checked the same way: `ls -l /proc/<pid>/fd`.
+
 ### Limits
 
 - A runner of the old version that starts at the very moment a deleter holds the exclusive lock
   runs unprotected, and its directory is going away.
 - Locks are advisory: anything that deletes an unpack without the protocol (an `rm -rf` by hand)
   is not stopped.
+
+## The wrapper's own output goes to stderr
+
+Upstream's `logger.info` and `logger.query` wrote to stdout. With `<APP>_INSTALL_DIR` set, the
+wrapper printed "[i] Install path is being overridden…" twice before the app's first byte. That
+broke any app speaking a protocol on stdout (an MCP server's JSON-RPC).
+
+Every level goes to stderr now. What a `maintenance` subcommand is asked for (`directory`,
+`meta`, `purge`) still goes to stdout, written there by the subcommand itself.
+
+Checked: with `GEEX_INSTALL_DIR` set, `geex --version 2>/dev/null` prints only
+`geex <version>`, where the build before printed the four `[i]` lines first.
 
 ## Verified (geex, 2026-10-18)
 

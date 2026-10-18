@@ -40,11 +40,13 @@ pub fn hold_in_use_lock(allocator: std.mem.Allocator, install_dir: []const u8) ?
     return file;
 }
 
-// Whether an older install directory may be deleted: the exclusive lock, held until the caller
-// closes it (`.claimed`), or why not.
+// Whether an install directory may be deleted: the exclusive lock, held until the caller closes
+// it (`.claimed`), or why not: a runner holds the lock (`.in_use`), or the directory is from
+// before the lock and a process runs from it (`.running`).
 const Claim = union(enum) {
     claimed: ?std.fs.File,
     in_use,
+    running,
 };
 
 fn claim_for_removal(allocator: std.mem.Allocator, dir: []const u8) Claim {
@@ -57,11 +59,69 @@ fn claim_for_removal(allocator: std.mem.Allocator, dir: []const u8) Claim {
     }) catch |err| switch (err) {
         error.WouldBlock => return .in_use,
         // An install from before the lock existed: in use if a process runs from it.
-        error.FileNotFound => return if (runs_from(allocator, dir)) .in_use else .{ .claimed = null },
+        error.FileNotFound => return if (runs_from(allocator, dir)) .running else .{ .claimed = null },
         else => return .in_use,
     };
 
     return .{ .claimed = file };
+}
+
+/// `maintenance purge`: delete every unpack of this app, the current version's too, that no
+/// process uses, by the lock contract (`claim_for_removal`), and say what became of each, on
+/// stdout. Some kept is not an error. One implementation of the contract on every platform, for
+/// a tool that can't take a `flock` itself (a BEAM can't).
+fn do_purge(install_dir: []const u8, out: *std.Io.Writer) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const app_name = metadata.parse(allocator, wrapper.RELEASE_METADATA_JSON).?.app_name;
+    const base = std.fs.path.dirname(install_dir) orelse return;
+    const prefix = try std.fmt.allocPrint(allocator, "{s}_erts-", .{app_name});
+
+    var base_dir = std.fs.openDirAbsolute(base, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try out.print("nothing to purge: {s} doesn't exist\n", .{base});
+            try out.flush();
+            return;
+        },
+        else => return err,
+    };
+    defer base_dir.close();
+
+    var removed: usize = 0;
+    var kept: usize = 0;
+    var itr = base_dir.iterate();
+
+    while (try itr.next()) |entry| {
+        if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, prefix)) continue;
+
+        const dir = try std.fs.path.join(allocator, &.{ base, entry.name });
+
+        // Another app whose name begins the same, or not an unpack at all: leave it.
+        const other = install.load_install_from_path(allocator, dir) catch null;
+        if (other == null or !std.mem.eql(u8, other.?.metadata.app_name, app_name)) continue;
+
+        switch (claim_for_removal(allocator, dir)) {
+            .claimed => |lock| {
+                defer if (lock) |file| file.close();
+                try std.fs.deleteTreeAbsolute(dir);
+                try out.print("removed {s}\n", .{dir});
+                removed += 1;
+            },
+            .in_use => {
+                try out.print("kept {s}: in use\n", .{dir});
+                kept += 1;
+            },
+            .running => {
+                try out.print("kept {s}: from before the in-use lock, and a process runs from it\n", .{dir});
+                kept += 1;
+            },
+        }
+    }
+
+    try out.print("{d} removed, {d} kept\n", .{ removed, kept });
+    try out.flush();
 }
 
 // Whether a process runs from `dir`, by each process's executable (`/proc/<pid>/exe`, Linux). A
@@ -106,6 +166,10 @@ pub fn do_maint(args: [][:0]u8, install_dir: []const u8) !void {
 
         if (std.mem.eql(u8, args[0], "meta")) {
             try print_metadata(stdout);
+        }
+
+        if (std.mem.eql(u8, args[0], "purge")) {
+            try do_purge(install_dir, stdout);
         }
     }
 }
@@ -184,7 +248,7 @@ pub fn do_clean_old_versions(install_prefix_path: []const u8, current_install_pa
             // from it (geex's fork). The exclusive lock is held while it is deleted.
             if (std.SemanticVersion.order(current_install.?.version, other_install.?.version) == .gt) {
                 switch (claim_for_removal(allocator, other_install.?.install_dir_path)) {
-                    .in_use => {
+                    .in_use, .running => {
                         std.log.debug("Kept older version (v{s}): in use", .{other_install.?.metadata.app_version});
                     },
                     .claimed => |lock| {
