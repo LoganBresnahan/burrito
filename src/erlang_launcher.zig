@@ -51,13 +51,21 @@ pub fn launch(install_dir: []const u8, env_map: *EnvMap, meta: *const MetaStruct
     }
 
     // Set all the required release arguments
-
+    //
+    // geex's fork: each flag and its values are separate argv elements. Upstream passed
+    // "-mode embedded", "-s elixir start_cli" and "-elixir ansi_enabled true" as single
+    // elements, which init doesn't split: the VM ran in interactive mode (loading modules
+    // lazily from the unpack, so deleting an unpack crashed an app still running from it),
+    // and the other two never took effect. "-mode", "embedded" is split so the release loads
+    // every module at boot. The other two are dropped, not split: they never ran, and making
+    // them run would change what apps see. `elixir:start_cli` would hand the app's arguments
+    // to Elixir's own CLI once boot finishes, which runs a file argument as a script, and
+    // ansi_enabled would start colouring log output.
     const erlang_cli = &[_][]const u8{
         erl_bin_path[0..],
-        "-elixir ansi_enabled true",
         "-noshell",
-        "-s elixir start_cli",
-        "-mode embedded",
+        "-mode",
+        "embedded",
         "-setcookie",
         release_cookie_content,
         "-boot",

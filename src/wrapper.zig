@@ -105,6 +105,11 @@ pub fn main() !void {
         log.debug("Skipping archive unpacking, this machine already has the app installed!", .{});
     }
 
+    // geex's fork: mark this install in use for the app's whole life, before cleaning up others.
+    // The file stays open: across the execve into the VM on POSIX, in this process on Windows.
+    const in_use_lock = maint.hold_in_use_lock(arena, install_dir);
+    defer if (in_use_lock) |file| file.close();
+
     // Clean up older versions
     const base_install_path = try get_base_install_dir(arena);
     try maint.do_clean_old_versions(base_install_path, install_dir);
